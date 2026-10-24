@@ -2,6 +2,7 @@ import random
 from dataclasses import dataclass, fields
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,12 @@ class QueuePolicy:
     limiter_down_retry_s: float
     unpublished_after_s: float
     stale_after_s: float
+
+    def __post_init__(self):
+        if not 0 <= self.critical_reserve < self.rate_limit:
+            raise ImproperlyConfigured("EMAIL_QUEUE: CRITICAL_RESERVE must be >= 0 and < RATE_LIMIT")
+        if self.max_attempts < 1:
+            raise ImproperlyConfigured("EMAIL_QUEUE: MAX_ATTEMPTS must be >= 1")
 
     @classmethod
     def from_settings(cls):

@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 
 from django.conf import settings
@@ -41,12 +42,12 @@ class SimulatedEmailProvider:
         name+slow@...    first call blocks for SLOW_SECONDS (the SIGKILL test kills it mid-call)
 
     Per-job call counts live in Redis, so they are shared by every worker
-    process. In-process callers (tests) can also read `calls`.
+    process. In-process callers (tests) can also read `calls` (the most recent 100k).
     """
 
     FLAKY_FAILURES = 2
     SLOW_SECONDS = 5.0
-    calls = []
+    calls = deque(maxlen=100_000)
     _lock = threading.Lock()
 
     def send(self, *, idempotency_key, to, subject, body):
