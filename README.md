@@ -21,7 +21,7 @@ python manage.py migrate
 pytest
 ```
 
-Expected: **35 passed** in about 40 s. The header line `redis: real server at redis://localhost:6379/15` confirms which Redis the tests used; they use Redis DB 15 and a throwaway `test_db.sqlite3`, never your data. Without Docker, the suite falls back to `fakeredis` and the two real-worker SIGKILL tests are skipped (**33 passed, 2 skipped**). No `.env` is needed; every setting has a local default (see `.env.example`).
+Expected: **35 passed** in about 40 s (verified from a fresh clone on macOS / Python 3.14 and in a Linux / Python 3.12 container; `.github/workflows/tests.yml` runs the same on push). The header line `redis: real server at redis://localhost:6379/15` confirms which Redis the tests used; they use Redis DB 15 and a throwaway `test_db.sqlite3`, never your data. Without Docker, the suite falls back to `fakeredis` and the two real-worker SIGKILL tests are skipped (**33 passed, 2 skipped**). No `.env` is needed; every setting has a local default (see `.env.example`).
 
 ## Section 1: reproduce the regression and the fix
 
