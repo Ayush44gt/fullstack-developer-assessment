@@ -138,6 +138,9 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
     # Must be longer than any countdown we schedule, or Redis would redeliver
     # deferred messages that a live worker is still holding.
     "visibility_timeout": int(os.environ.get("CELERY_VISIBILITY_TIMEOUT", 3600)),
+    # BRPOP the queues in the order given to `-Q` (critical first) instead of
+    # kombu's default round-robin, so OTPs never wait behind a bulk backlog.
+    "queue_order_strategy": "priority",
 }
 CELERY_BEAT_SCHEDULE = {
     "republish-stuck-email-jobs": {"task": "notifications.republish_stuck_jobs", "schedule": 300.0},
