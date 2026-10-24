@@ -17,7 +17,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
 class OrderSummarySerializer(serializers.ModelSerializer):
     """One row of the mobile dashboard. Also reused by the invoice PDF job."""
 
-    items = OrderItemSerializer(many=True, read_only=True)
+    items = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
 
@@ -25,9 +25,16 @@ class OrderSummarySerializer(serializers.ModelSerializer):
         model = Order
         fields = ["id", "reference", "status", "created_at", "item_count", "total", "items"]
 
+    def _billable_items(self, obj):
+        # FIN-231: refunded lines must not be shown or counted towards totals.
+        return obj.items.exclude(status=OrderItem.Status.REFUNDED)
+
+    def get_items(self, obj):
+        return OrderItemSerializer(self._billable_items(obj), many=True).data
+
     def get_item_count(self, obj):
-        return len(obj.items.all())
+        return self._billable_items(obj).count()
 
     def get_total(self, obj):
-        total = sum((item.line_total for item in obj.items.all()), Decimal("0.00"))
+        total = sum((item.line_total for item in self._billable_items(obj)), Decimal("0.00"))
         return f"{total:.2f}"

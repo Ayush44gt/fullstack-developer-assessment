@@ -18,3 +18,13 @@ def test_summary_lists_orders_with_totals(client, make_customer):
     assert body["lifetime_spend"] == "60.00"
     assert [o["total"] for o in body["orders"]] == ["30.00", "30.00"]
     assert all(o["item_count"] == 3 for o in body["orders"])
+
+
+def test_refunded_lines_are_excluded(client, make_customer):
+    user = make_customer(orders=2, items=3, refund_first_line=True)
+    client.force_login(user)
+
+    body = client.get(URL).json()
+
+    assert body["lifetime_spend"] == "40.00"
+    assert all(o["item_count"] == 2 and len(o["items"]) == 2 for o in body["orders"])
