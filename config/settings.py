@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "orders",
+    "notifications",
 ]
 
 MIDDLEWARE = [
@@ -108,4 +109,57 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.BasicAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+}
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"notifications": {"handlers": ["console"], "level": "INFO", "propagate": False}},
+}
+
+# --- Section 2: email queue ---------------------------------------------------
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", REDIS_URL)
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_TASK_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_IGNORE_RESULT = True  # job state lives in EmailJob rows, not a result backend
+CELERY_TASK_DEFAULT_QUEUE = "default"
+
+# Crash safety. ANSWERS.md ("Section 2: SIGKILL") explains each one.
+CELERY_TASK_ACKS_LATE = True  # ack when the task returns, not when it starts
+CELERY_TASK_REJECT_ON_WORKER_LOST = True  # child process killed mid-task -> requeue, don't ack
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # a dead worker strands at most `concurrency` messages
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    # Unacked messages of a worker that vanished are redelivered after this.
+    # Must be longer than any countdown we schedule, or Redis would redeliver
+    # deferred messages that a live worker is still holding.
+    "visibility_timeout": int(os.environ.get("CELERY_VISIBILITY_TIMEOUT", 3600)),
+}
+CELERY_BEAT_SCHEDULE = {
+    "republish-stuck-email-jobs": {"task": "notifications.republish_stuck_jobs", "schedule": 300.0},
+}
+
+EMAIL_PROVIDER = os.environ.get("EMAIL_PROVIDER", "notifications.providers.SimulatedEmailProvider")
+
+# Read by notifications.policy.QueuePolicy; DESIGN.md explains every value.
+EMAIL_QUEUE = {
+    "RATE_KEY": "ratelimit:email-provider",
+    "RATE_LIMIT": 200,  # provider allows 200 emails...
+    "RATE_WINDOW_MS": 60_000,  # ...per minute
+    "RATE_GUARD_MS": 1_000,  # we measure over 61 s to absorb send->provider latency jitter
+    "CRITICAL_RESERVE": 20,  # slots per window that only OTP/alert emails may use
+    "MAX_ATTEMPTS": 6,  # provider attempts before a job is dead-lettered
+    "BACKOFF_BASE_S": 10.0,  # 10, 20, 40, 80, 160 s (each with jitter)
+    "BACKOFF_MAX_S": 300.0,
+    "THROTTLE_JITTER_S": 2.0,  # spread jobs that wake up for the same free slot
+    # A SENDING claim older than this belongs to a dead worker. Must exceed the
+    # send task's hard time_limit (45 s), after which a live attempt is killed.
+    "CLAIM_TTL_S": float(os.environ.get("EMAIL_CLAIM_TTL_S", 90)),
+    "LIMITER_DOWN_RETRY_S": 5.0,
+    "UNPUBLISHED_AFTER_S": 60.0,  # sweeper: QUEUED but the broker never took the message
+    "STALE_AFTER_S": 1_800.0,  # sweeper: no progress for 30 min -> assume the message was lost
 }

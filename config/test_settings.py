@@ -8,3 +8,7 @@ INSTALLED_APPS = [app for app in INSTALLED_APPS if app != "silk"]
 MIDDLEWARE = [mw for mw in MIDDLEWARE if not mw.startswith("silk.")]
 
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]
+
+# In-process broker for the embedded test worker. The rate limiter still uses
+# Redis (a real server when one is reachable; see notifications/tests/conftest.py).
+CELERY_BROKER_URL = "memory://"
