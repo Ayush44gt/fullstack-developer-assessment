@@ -13,7 +13,7 @@ class OrderSummaryView(APIView):
     def get(self, request):
         orders = (
             Order.objects.filter(customer=request.user)
-            .prefetch_related("items__product")
+            .with_billable_items()
             .order_by("-created_at")
         )
         rows = OrderSummarySerializer(orders, many=True).data

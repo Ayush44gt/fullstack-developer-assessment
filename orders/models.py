@@ -12,6 +12,23 @@ class Product(models.Model):
         return self.name
 
 
+class OrderQuerySet(models.QuerySet):
+    def with_billable_items(self):
+        """Attach `order.billable_items`: non-refunded lines with their product.
+
+        Costs one extra query for the whole queryset (`order_id IN (...)` with
+        product JOINed), however many orders there are. Readers use the plain
+        list attribute, so nothing can silently fall back to a query per order.
+        """
+        return self.prefetch_related(
+            models.Prefetch(
+                "items",
+                queryset=OrderItem.objects.billable().select_related("product").order_by("pk"),
+                to_attr="billable_items",
+            )
+        )
+
+
 class Order(models.Model):
     class Status(models.TextChoices):
         PENDING = "pending"
@@ -27,11 +44,18 @@ class Order(models.Model):
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PAID)
     created_at = models.DateTimeField(default=timezone.now)
 
+    objects = OrderQuerySet.as_manager()
+
     class Meta:
         indexes = [models.Index(fields=["customer", "-created_at"], name="order_customer_recent")]
 
     def __str__(self):
         return self.reference
+
+
+class OrderItemQuerySet(models.QuerySet):
+    def billable(self):
+        return self.exclude(status=OrderItem.Status.REFUNDED)
 
 
 class OrderItem(models.Model):
@@ -44,6 +68,8 @@ class OrderItem(models.Model):
     quantity = models.PositiveIntegerField(default=1)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+
+    objects = OrderItemQuerySet.as_manager()
 
     @property
     def line_total(self):
