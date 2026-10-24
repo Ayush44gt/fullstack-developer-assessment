@@ -4,7 +4,7 @@ The worker runs in-process (celery.contrib.testing) on the in-memory broker,
 so the test needs no running services. The limiter uses a real Redis when one
 is reachable, else fakeredis.
 
-The limit is scaled from 200/min to 50/s so the run takes ~10 s rather than
+The limit is scaled from 200/min to 50/s so the run takes ~15 s rather than
 3 minutes; the limiter code and Lua script are exactly the production ones.
 """
 

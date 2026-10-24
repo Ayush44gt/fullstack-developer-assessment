@@ -42,6 +42,9 @@ def republish_stuck_jobs(policy, now=None):
     """Re-publish jobs whose message the broker never got or has lost.
 
     - QUEUED and never published: Redis was down when the job was created.
+    - SENDING under a claim older than `claim_ttl_s` and untouched since: the
+      attempt died and nothing will redeliver it. A hard time-limit kill does
+      this, because Celery acks the message (task_acks_on_failure_or_timeout).
     - Unfinished and untouched for `stale_after_s`: the message was lost, e.g.
       Redis restarted without its AOF.
 
@@ -51,6 +54,7 @@ def republish_stuck_jobs(policy, now=None):
     now = now or timezone.now()
     stuck = EmailJob.objects.exclude(status__in=EmailJob.TERMINAL).filter(
         Q(enqueued_at__isnull=True, created_at__lt=now - timedelta(seconds=policy.unpublished_after_s))
+        | Q(status=EmailJob.Status.SENDING, updated_at__lt=now - timedelta(seconds=policy.claim_ttl_s))
         | Q(updated_at__lt=now - timedelta(seconds=policy.stale_after_s))
     )
     republished = 0

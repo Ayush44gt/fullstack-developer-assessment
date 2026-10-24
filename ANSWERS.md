@@ -11,9 +11,9 @@ Written answers, labelled by section. Section 2's architecture is in [DESIGN.md]
 
 ## Section 1: Diagnose a broken system
 
-**Short version.** The deployment changed a *shared serializer*, not the view. The FIN-231 change (exclude refunded lines from totals) made the serializer call `obj.items.exclude(...)` three times per order. `.exclude()` returns a new QuerySet, and a new QuerySet never reads the cache that the view's `prefetch_related("items__product")` had filled. The result is an N+1: 3 queries per order, plus one product query per line item. For a 250-order customer that is **1,611 queries instead of 2**. Fixed with a filtered `Prefetch(..., to_attr=...)`, so the query count is constant again.
+**Short version.** The deployment changed a *shared serializer*, not the view. The FIN-231 change (exclude refunded lines from totals) made the serializer call `obj.items.exclude(...)` three times per order. `.exclude()` returns a new QuerySet, and a new QuerySet never reads the cache that the view's `prefetch_related("items__product")` had filled. The result is an N+1: 3 queries per order, plus one product query per non-refunded line item. For a 250-order customer that is **1,611 queries instead of 2**. Fixed with a filtered `Prefetch(..., to_attr=...)`, so the query count is constant again.
 
-The git history replays the incident: `git log --oneline` shows the baseline, the FIN-231 deploy (`git show e1f6177`: only `serializers.py` changed), and the fix.
+The git history replays the incident: `git log --oneline` shows the baseline, the FIN-231 deploy (`git show 107fa7e`: only `serializers.py` and its functional test changed), and the fix.
 
 ### 1.1 Incident investigation log
 
@@ -26,21 +26,21 @@ The scenario is constructed, so steps 1–4 describe what I would check in produ
 | 2 | **Is it global or per-row?** Compare light and heavy customers on the same release, and look at DB CPU, connection-pool waits and network. | Infrastructure causes (saturated DB, exhausted pool, network) hit *everyone*. A cost that grows with each customer's row count means per-row work: an N+1, or expensive Python per row. | Light customers are fine and latency grows linearly with order count. **Hypothesis: per-row queries.** |
 | 3 | **What actually changed?** `git diff <prev>..<release> --stat`, the requirements diff, new migrations (`sqlmigrate` them: a dropped index?), settings. | "No change to the view" doesn't mean nothing on its path changed. Serializers, model managers and properties, middleware and dependencies all run inside that request. | Only `orders/serializers.py` changed (FIN-231). It is shared with the invoice job. No migrations, no dependency bumps. |
 | 4 | **Database view.** `pg_stat_statements` ordered by `calls` and `total_exec_time` since the deploy; `EXPLAIN` on the hot statement. | Separates "a few slow queries" (index/plan problems) from "a huge number of fast ones" (N+1). | The `orders_orderitem WHERE order_id = $1 AND NOT status = $2` shape jumps ~100× in calls, at sub-ms mean time on the FK index. **Rules out a missing index.** |
-| 5 | **Reproduce locally** with production-shaped data: `seed_orders` (a 5-order and a 250-order customer), then hit the endpoint through django-silk. | Turns telemetry into a deterministic, inspectable request. | Regressed: **38 queries** (light) vs **1,613** (heavy). The count grows by 7 per order (4 lines each). |
-| 6 | **Pinpoint the code.** Silk stores a stack trace for each query; group the queries by shape. | Shows *which line* issues each repeated query. | 858× product lookup from `get_items`, 500× item SELECT from `get_items`/`get_total`, 250× `COUNT(*)` from `get_item_count`. The view's two prefetch queries still run, but nothing reads their results. |
+| 5 | **Reproduce locally** with production-shaped data: `seed_orders` (a 5-order and a 250-order customer), then hit the endpoint through django-silk. | Turns telemetry into a deterministic, inspectable request. | Regressed: **38 queries** (light) vs **1,613** (heavy): 3 per order plus 1 per non-refunded line (858 of the 1,000 lines), about 6.4 per order. |
+| 6 | **Pinpoint the code.** Silk stores a stack trace for each query; group the queries by shape. | Shows *which line* issues each repeated query. | 858× product lookup from `get_items`, 500× item SELECT (250 from `get_items`, 250 from `get_total`), 250× `COUNT(*)` from `get_item_count`. The view's two prefetch queries still run, but nothing reads their results. |
 | 7 | **Confirm the mechanism, not just the symptom.** A test asserting the exact growth: `(N₂ − N₁) × (3 + items_per_order)` extra queries. | If my model of the ORM's behaviour is right, the formula is exact. | Exact match (`test_regressed_summary_is_n_plus_one`). **Root cause confirmed.** |
-| 8 | **Fix and verify,** then add a guard against recurrence. | The FIN-231 functional tests passed against the broken code, which is why it shipped. | 1,611 → 2 queries; ~370 → ~23 ms locally; **~5.8 s → ~28 ms** with a 2 ms simulated DB round trip. A test now pins the endpoint at 4 queries (including 2 auth), whatever the order count. |
+| 8 | **Fix and verify,** then add a guard against recurrence. | The FIN-231 functional tests passed against the broken code, which is why it shipped. | 1,611 → 2 queries; ~350 → ~24 ms locally; **~6 s → ~27 ms** with a 2 ms simulated DB round trip. A test now pins the endpoint at 4 queries (including 2 auth), whatever the order count. |
 
 ### 1.2 Root cause category: N+1 query (caused by silently bypassing the prefetch cache)
 
 Why N+1 and not the other candidates:
 
 - **Missing index:** that would slow *every* customer, with cost scaling with table size, and it shows up as a high *mean time* per statement. Here each statement is fast, there are just thousands of them, and the deploy contained no migration.
-- **Serializer overhead:** the fixed endpoint serializes the identical 250-order payload in ~23 ms total. Python-side DRF work is not where 30 s goes.
+- **Serializer overhead:** the fixed endpoint serializes the identical 250-order payload in ~24 ms total. Python-side DRF work is not where 30 s goes.
 - **Cache invalidation:** nothing caches this endpoint, and the cold path was 80 ms before the deploy.
 - **ORM misconfiguration:** partly yes. The ORM silently threw away the view's prefetch. But the observable failure is an N+1, and the fix is an N+1 fix.
 
-Why it reached 30 s in production when it's 0.4 s on a laptop: in-process SQLite has no network hop. Each of the 1,611 queries pays a round trip to the database, plus connection-pool waits while many heavy customers refresh at once. At 15–20 ms per query under that load, that is 24–32 s, i.e. the 30 s timeout. The `profile_summary` command adds a 2 ms simulated round trip per query to show the shape: ~370 ms becomes ~5.8 s.
+Why it reached 30 s in production when it's 0.4 s on a laptop: in-process SQLite has no network hop. Each of the 1,611 queries pays a round trip to the database, plus connection-pool waits while many heavy customers refresh at once. At 15–20 ms per query under that load, that is 24–32 s, i.e. the 30 s timeout. The `profile_summary` command adds a 2 ms simulated round trip per query to show the shape: ~350 ms becomes ~6 s.
 
 ### 1.3 The code that demonstrates the problem
 
@@ -88,8 +88,8 @@ Full output: [docs/section1/profiling-evidence.md](docs/section1/profiling-evide
 
 | Customer | Orders | Regressed: queries | Fixed: queries | Regressed: time | Fixed: time |
 |---|---:|---:|---:|---:|---:|
-| light_customer | 5 | 38 | 4 | 8 ms | 2 ms |
-| heavy_customer | 250 | **1,613** | **4** | 370 ms (5.8 s with 2 ms RTT) | 23 ms (28 ms with 2 ms RTT) |
+| light_customer | 5 | 38 | 4 | 8 ms | 3 ms |
+| heavy_customer | 250 | **1,613** | **4** | 346 ms (6.4 s with 2 ms RTT) | 24 ms (27 ms with 2 ms RTT) |
 
 The query counts are silk's (they include 2 session/user queries). The times come from calling the view directly with no profiler, median of 5 runs. Silk's own request timings are higher because silk runs an `EXPLAIN` and stores a stack trace for every query it records. I chose silk over django-debug-toolbar because this is a JSON API consumed by a mobile app. The toolbar only injects into HTML responses, while silk records every request (including API calls and test-client calls) and keeps them in the DB for later comparison.
 
@@ -104,12 +104,12 @@ The query counts are silk's (they include 2 session/user queries). The times com
 
 ## Section 2: What happens to in-flight tasks when a worker is SIGKILL'd?
 
-**With Celery's defaults, the task is lost.** `task_acks_late=False` acknowledges the message when the worker *starts* executing it, so SIGKILL leaves nothing in the broker to redeliver. This project changes that with three settings (`config/settings.py`), and both cases below are exercised by `notifications/tests/test_worker_crash.py` against real worker subprocesses and real Redis.
+**With Celery's defaults, the task is lost.** `task_acks_late=False` acknowledges the message when the worker *starts* executing it, so SIGKILL leaves nothing in the broker to redeliver. This project changes that with four settings (`config/settings.py`), and both cases below are exercised by `notifications/tests/test_worker_crash.py` against real worker subprocesses and real Redis.
 
 ```python
 CELERY_TASK_ACKS_LATE = True             # ack after the task returns
 CELERY_TASK_REJECT_ON_WORKER_LOST = True # child died mid-task -> reject(requeue=True), not ack
-CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # a dead worker strands at most `concurrency` messages
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # reserve at most `concurrency` ready messages (ETA ones come on top)
 CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 3600}
 ```
 
@@ -123,17 +123,19 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 3600}
 job 1ac4286e…: sent on attempt 2
 ```
 
-**Case 2: the MainProcess, or the whole host or container, dies.** Nobody is left to reject. On Linux the children die too, because Celery sets `PR_SET_PDEATHSIG` on every pool child (`celery/concurrency/prefork.py`, `process_initializer`). The message is not lost: in the Redis transport, a delivered-but-unacked message lives in the **`unacked` hash** (and the `unacked_index` sorted set, scored by delivery time). `QoS.restore_visible()` in any live worker moves entries older than **`visibility_timeout`** back onto their queue. It runs when a worker starts and then on every 10th tick of a 10 s timer, so redelivery takes `visibility_timeout` plus up to about 100 s. The test kills the whole process group, checks that `HLEN unacked ≥ 1`, starts a fresh worker after the 5 s test timeout, and the job is delivered on attempt 2. Deferred (ETA) messages the dead worker was holding are unacked messages too, so they come back the same way. (A SIGTERM warm shutdown returns them immediately; SIGKILL cannot be caught.)
+**Case 2: the MainProcess, or the whole host or container, dies.** Nobody is left to reject. On Linux the children die too, because Celery sets `PR_SET_PDEATHSIG` on every pool child (`celery/concurrency/prefork.py`, `process_initializer`). The message is not lost: in the Redis transport, a delivered-but-unacked message lives in the **`unacked` hash** (and the `unacked_index` sorted set, scored by delivery time). `QoS.restore_visible()` in any live worker moves entries older than **`visibility_timeout`** back onto their queue. It runs when a worker starts and then on every 10th tick of a 10 s timer, so redelivery takes `visibility_timeout` plus up to about 100 s. The test kills the whole process group, checks that `HLEN unacked ≥ 1`, starts a fresh worker after the 5 s test timeout, and the job is delivered on attempt 2. Deferred (ETA) messages the dead worker was holding are unacked messages too, so they come back the same way. Prefetch does not bound those: Celery raises the prefetch count for every ETA message it accepts, so during a flash sale one dead worker can strand hundreds of deferred jobs until `visibility_timeout` (or the sweeper) returns them. A SIGTERM warm shutdown returns them immediately; SIGKILL cannot be caught.
+
+**Related case: the hard time limit.** When `time_limit=45` kills a stuck attempt, Celery *acks* the message (`task_acks_on_failure_or_timeout` defaults to True), so nothing will redeliver it and the job is left `sending`. The beat sweeper re-publishes any `sending` job whose claim has expired (`test_sweeper_rescues_an_attempt_that_died_without_redelivery`). The soft limit (30 s) normally fires first and goes through the ordinary retry path.
 
 **How the implementation makes redelivery safe.** Redelivery means at-least-once, so the task must tolerate seeing the same job twice:
 
 1. **Finished jobs are no-ops.** The task first reads the `EmailJob` row; if it is `sent` or `dead`, it returns.
 2. **No concurrent double-send.** The provider is called only after a conditional `UPDATE … SET status='sending', claimed_at=now, attempts=attempts+1 WHERE status IN ('queued','retrying') OR (status='sending' AND claimed_at < now − 90 s)`. Exactly one worker can match it. A redelivered task that finds a *fresh* `sending` claim can't tell whether the other attempt is dead or merely slow, so it re-schedules itself until the claim expires: the "Retry in 2.5s" above. The claim TTL (90 s) exceeds the task's hard `time_limit` (45 s). Once the TTL passes, the original attempt has either finished (the row says `sent`, so this is a no-op) or was certainly killed (so re-claim, attempt 2).
 3. **Fencing.** Result writes are conditional on `claimed_at`, so an attempt that outlived its claim can't overwrite the newer attempt's result.
-4. **Poison messages end.** The attempt is counted at claim time, before the provider call. A job that kills its worker every time exhausts `MAX_ATTEMPTS` and is dead-lettered instead of looping.
+4. **Poison messages end.** The attempt is counted at claim time, before the provider call, because an attempt that kills its worker never reaches an except-branch. When a redelivery finds an expired claim with no attempts left, it dead-letters the job without calling the provider (`test_job_that_kills_its_worker_every_time_is_dead_lettered`).
 5. **The remaining gap is honest and small.** If the provider accepted the email and the worker died before the `sent` UPDATE committed, a few milliseconds, the email goes out twice. Closing that needs the provider's help: `job.id` is passed as an idempotency key. Without it, a rare duplicate confirmation is the better failure than a lost one.
 
-**The visibility-timeout trade-off.** It must exceed the longest countdown we schedule (300 s of backoff, about 63 s of throttling). Otherwise Redis would hand deferred messages to a second worker while the first still holds them. That would be harmless thanks to (2), but wasteful. A long timeout means slow recovery after a host loss, so a beat task (`republish_stuck_jobs`) also re-publishes any job with no progress for 30 minutes. That also covers messages Redis itself lost.
+**The visibility-timeout trade-off.** It must exceed the longest countdown we schedule (300 s of backoff, about 63 s of throttling). Otherwise Redis would hand deferred messages to a second worker while the first still holds them. That would be harmless thanks to (2), but wasteful. A long timeout means slow recovery after a host loss, so the beat task `republish_stuck_jobs` also re-publishes any job with no progress for 30 minutes. That also covers messages Redis itself lost.
 
 ---
 
@@ -149,7 +151,7 @@ A primary-key index helps lookups by id, but the changelist issues other queries
 
 **2. N+1 from `list_display`.** Every FK column (`customer`) or callable (`customer.email`, `item_count`) costs one query per row: 100 rows, 100+ queries. Fix: `list_select_related = ("customer",)` for forward FKs. For reverse relations and aggregates, override `get_queryset()` with `.annotate(item_count=Count("items"))` and expose it through `@admin.display(ordering="item_count")`. Trade-off: the joins and aggregates make the single remaining query heavier, so keep `list_display` lean.
 
-**3. Sorting and searching that can't use an index.** Sorting by a clicked column, or by a model `Meta.ordering` on an unindexed column, forces PostgreSQL to sort all 500k rows to return 100. `search_fields = ("email", "name")` generates `UPPER(col) LIKE UPPER('%term%')` per field, ORed together, and the leading wildcard can't use a B-tree. Fix: add `Meta.indexes` matching the default ordering and limit `sortable_by` to indexed columns. Make searches exact (`"=email"`) or prefix (`"^name"`) lookups, or add a `pg_trgm` GIN index when substring search really is needed. Trade-off: each index slows writes and costs disk.
+**3. Sorting and searching that can't use an index.** Sorting by a clicked column, or by a model `Meta.ordering` on an unindexed column, forces PostgreSQL to sort all 500k rows to return 100. `search_fields = ("email", "name")` generates `UPPER(col::text) LIKE UPPER('%term%')` per field, ORed together, and no plain B-tree can serve that. Fix: add `Meta.indexes` matching the default ordering and limit `sortable_by` to indexed columns. Make searches exact (`"=email"`) or prefix (`"^name"`) lookups backed by expression indexes, `Index(Upper("email"))` and, for prefix matching, `Index(OpClass(Upper("name"), name="text_pattern_ops"))`. Use a `pg_trgm` GIN index only where substring search is required. Trade-off: each index slows writes and costs disk.
 
 Also worth checking: `list_filter` on a large FK renders every related row in the sidebar, so use a `SimpleListFilter` or an autocomplete filter. And FK `<select>` widgets on the change form should become `raw_id_fields` or `autocomplete_fields`.
 
@@ -157,11 +159,11 @@ Also worth checking: `list_filter` on a large FK renders every related row in th
 
 **Offset** (DRF `LimitOffsetPagination` / `PageNumberPagination`) runs `ORDER BY created_at DESC LIMIT 20 OFFSET 9980`. The database can't jump to row 9,980: it walks the index (or sorts) and discards 9,980 rows, so cost grows linearly with depth, and page 500 costs roughly 500× page 1. DRF also issues a `COUNT(*)` on every page for `count` and the page links, which is another scan.
 
-The bigger product problem is **mutation**. Infinite scroll fetches page 2 *after* the user has read page 1. If three orders were inserted at the top meanwhile, every row shifts down three, so page 2 opens with three items the user has already seen. A deletion shifts rows up, and one item is silently never shown. Clients end up de-duplicating by id and still can't recover the skipped rows.
+The bigger product problem is **mutation**. Infinite scroll fetches page 2 *after* the user has read page 1. If three orders were inserted at the top meanwhile, every row shifts down three, so page 2 opens with three items the user has already seen. A deletion shifts rows up, and one item is silently never shown. Clients can de-duplicate by id but can't recover skipped rows.
 
 **Cursor** (DRF `CursorPagination`) encodes the position of the last row seen: `WHERE created_at < :last ORDER BY created_at DESC LIMIT 21`. With an index on `(customer_id, created_at)` this is an index seek: page 500 costs the same as page 1, and there is no `COUNT`. Rows inserted above the cursor shift nothing, so infinite scroll never duplicates or skips.
 
-What it sacrifices: no "jump to page 37", no total count, and no arbitrary client-chosen sorting (each ordering needs its own index and a stable key). The cursor is also opaque. DRF filters on the *first* ordering field only and breaks ties with an offset stored inside the cursor, so order by something unique and immutable (`-id`, or a high-resolution `created_at`). Ordering by a mutable field such as `updated_at` lets an edited row jump past the cursor and be skipped.
+What it sacrifices: no "jump to page 37", no total count, and no arbitrary client-chosen sorting (each ordering needs its own index and a stable key). DRF filters on the *first* ordering field only and breaks ties with an offset stored inside the cursor, so order by something unique and immutable (`-id`, or a high-resolution `created_at`). Ordering by a mutable field such as `updated_at` lets an edited row jump past the cursor and be skipped.
 
 **When to choose which.** Cursor for user-facing, append-heavy lists: mobile feeds, order history, sync or export jobs that walk a whole table. Offset where random access and totals matter and the data is small or rarely changes: admin tables, search results nobody reads past page 5. For this 10,000-record endpoint consumed by a mobile app, cursor. It also caps Section 1's class of bug at one page per request.
 
@@ -172,6 +174,7 @@ What it sacrifices: no "jump to page 37", no total count, and no arbitrary clien
 - **Section 1 is constructed**, as the brief asks ("You construct this yourself"). The production telemetry in the investigation log (gunicorn timeout, `pg_stat_statements`) describes what I would check and what this bug necessarily shows there. Everything from the local reproduction onward is real output from this repo.
 - **"Celery with a Redis backend"** is read as Redis as the **broker**. No result backend is configured (`task_ignore_result=True`), because job state lives in the `EmailJob` row; storing results in Redis as well would be a second, weaker source of truth.
 - **The 500-job test scales the limit** from 200/min to 50/s so it runs in about 15 s instead of 3 minutes. The limiter code and Lua script are the production ones, and the production 200/min numbers are tested separately on a pinned clock (`test_rate_limiter.py`) and were observed in a live run (DESIGN.md, "Measured behaviour").
+- **No `time.sleep()` in the limiter or the task path.** A denied send is re-scheduled with `self.retry(countdown=…)`, and the worker is free in the meantime. `git grep time.sleep` finds only tooling and simulations: the simulated provider's `+slow` mode (a hung provider for the SIGKILL test), `profile_summary`'s simulated DB round trip, `queue_monitor`'s refresh interval, and test polling loops.
 - **"Never exceeded" is measured at the provider**, counting *every* call, failed ones included, because a provider meters requests, not successful deliveries.
 - **Database:** SQLite (WAL mode) so the project runs in minutes with no setup. The ORM behaviour in Section 1 is database-independent; the production notes assume PostgreSQL.
 - **macOS:** billiard ≥ 4.3 starts prefork children with `spawn` on macOS, and Celery then needs `FORKED_BY_MULTIPROCESSING=1` to initialise them (otherwise every task fails with "not enough values to unpack"). `config/celery.py` sets it on macOS only; Linux is unaffected.

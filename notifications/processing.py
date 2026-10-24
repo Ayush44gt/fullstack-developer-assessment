@@ -25,6 +25,10 @@ log = logging.getLogger(__name__)
 Status = EmailJob.Status
 
 
+class AttemptAbandoned(Exception):
+    """The worker running an attempt died before recording any result."""
+
+
 class Outcome(str, Enum):
     SENT = "sent"
     DEFERRED = "deferred"  # not attempted (no slot / Redis down / held elsewhere); not counted as an attempt
@@ -55,6 +59,13 @@ def process_email_job(job_id, *, limiter, provider, policy):
             # Maybe still in flight on another worker. Look again once its claim
             # has expired; by then that attempt has finished or was killed.
             return Result(Outcome.DEFERRED, policy.claim_ttl_s - held_for, "held by another worker")
+        if job.attempts >= policy.max_attempts:
+            # The last allowed attempt's worker died mid-call (SIGKILL, OOM, hard
+            # time limit), so no except-branch ever ran. Stop here: a job that
+            # kills its worker every time must not crash-loop forever.
+            exc = AttemptAbandoned(f"worker died during attempt {job.attempts}; no result recorded")
+            _dead_letter(job, DeadLetter.Reason.RETRIES_EXHAUSTED, exc)
+            return Result(Outcome.DEAD, detail=_describe(exc))
 
     try:
         decision = limiter.try_acquire(limit=policy.limit_for(critical=job.is_critical))
@@ -94,12 +105,12 @@ def _claim(job, now, policy):
 
     If two workers hold messages for the same job, the database lets exactly
     one UPDATE match. The attempt is counted here, before the provider call, so
-    a job that crashes its worker every time still runs out of attempts.
+    an attempt whose worker dies still uses up one of the job's attempts.
     """
     claimable = Q(status__in=[Status.QUEUED, Status.RETRYING]) | Q(
         status=Status.SENDING, claimed_at__lt=now - timedelta(seconds=policy.claim_ttl_s)
     )
-    claimed = EmailJob.objects.filter(claimable, pk=job.pk).update(
+    claimed = EmailJob.objects.filter(claimable, pk=job.pk, attempts__lt=policy.max_attempts).update(
         status=Status.SENDING, claimed_at=now, attempts=F("attempts") + 1, updated_at=now
     )
     if claimed:

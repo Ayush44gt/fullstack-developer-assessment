@@ -21,25 +21,25 @@ python manage.py migrate
 pytest
 ```
 
-Expected: **35 passed** in about 40 s (verified from a fresh clone on macOS / Python 3.14 and in a Linux / Python 3.12 container; `.github/workflows/tests.yml` runs the same on push). The header line `redis: real server at redis://localhost:6379/15` confirms which Redis the tests used; they use Redis DB 15 and a throwaway `test_db.sqlite3`, never your data. Without Docker, the suite falls back to `fakeredis` and the two real-worker SIGKILL tests are skipped (**33 passed, 2 skipped**). No `.env` is needed; every setting has a local default (see `.env.example`).
+Expected: **39 passed** in about 40 s (verified from a fresh clone on macOS / Python 3.14 and in Linux containers on Python 3.10, 3.12 and 3.14; `.github/workflows/tests.yml` runs the same on push). The header line `redis: real server at redis://localhost:6379/15` confirms which Redis the tests used; they use Redis DB 15 and a throwaway `test_db.sqlite3`, never your data. Without Docker, the suite falls back to `fakeredis` and the two real-worker SIGKILL tests are skipped (**37 passed, 2 skipped**). No `.env` is needed; every setting has a local default (see `.env.example`).
 
 ## Section 1: reproduce the regression and the fix
 
 ```bash
-git log --oneline                     # baseline -> FIN-231 deploy (serializer only) -> fix
+git log --oneline                     # baseline -> FIN-231 deploy (serializer + its test only) -> fix
 python manage.py seed_orders          # a 5-order and a 250-order customer (prints their passwords)
 python manage.py profile_summary      # django-silk before/after -> docs/section1/profiling-evidence.md
 pytest orders                         # query-count guards: fixed = constant 4, regressed = exact N+1 formula
 ```
 
-To browse the recorded requests in silk's UI: `python manage.py createsuperuser`, then `python manage.py runserver`, log in at <http://localhost:8000/admin/>, and open <http://localhost:8000/silk/requests/>. As a customer (seeded password) you can compare `/api/orders/summary/` with `/api/orders/summary/regressed/` in DRF's browsable API.
+To browse the recorded requests in silk's UI: `python manage.py createsuperuser`, then `python manage.py runserver`, log in at <http://localhost:8000/admin/>, and open <http://localhost:8000/silk/requests/>. To compare the two endpoints as a customer, log in at <http://localhost:8000/api-auth/login/> as `heavy_customer` (password printed by `seed_orders`) and open `/api/orders/summary/` and `/api/orders/summary/regressed/` in DRF's browsable API. Or use curl: `curl -u heavy_customer:<password> http://localhost:8000/api/orders/summary/`.
 
 ## Section 2: run the queue
 
-Three terminals, each with the virtualenv active:
+Three terminals, each with the virtualenv active (a fourth, `celery -A config beat`, is optional; see below):
 
 ```bash
-# 1. worker: critical queue listed first = polled first
+# 1. worker: critical listed first = polled first (the sweeper task is routed there too)
 celery -A config worker -Q emails.critical,emails.bulk --concurrency 4 -l INFO
 
 # 2. live view: Redis queue depth, unacked/deferred messages, limiter window (x/200), job states
@@ -49,7 +49,7 @@ python manage.py queue_monitor
 python manage.py email_burst --count 500
 ```
 
-You should see the limiter window climb to about 195/200 within a second (180 bulk plus OTPs using the 20-slot reserve) and never pass 200. The backlog drains in one-minute waves, the flaky emails retry with backoff (`attempt 1 failed (503 …), retrying in 7.0s` in the worker log), and the bounce lands in **Admin → Dead letters**, where the "Replay" action re-queues it. `celery -A config beat` runs the 5-minute sweeper that re-publishes stuck jobs.
+You should see the limiter window climb to about 195/200 within a second (180 bulk plus OTPs using the 20-slot reserve) and never pass 200. The backlog drains in one-minute waves, the flaky emails retry with backoff (`attempt 1 failed (503 …), retrying in 7.0s` in the worker log), and the bounce lands in **Admin → Dead letters**, where the "Replay" action re-queues it. `celery -A config beat` sends the 5-minute sweeper task, which re-publishes stuck jobs; the worker above runs it.
 
 Over HTTP, as a staff user: `POST /api/notifications/emails/` with `{"kind": "otp", "to": "...", "subject": "...", "body": "..."}` returns `202`; `GET /api/notifications/emails/<id>/` shows its status.
 
@@ -57,10 +57,10 @@ Key tests:
 
 | Test | Proves |
 |---|---|
-| `notifications/tests/test_queue_500.py` | 500 jobs through a real Celery worker: none lost, each delivered exactly once, rate never exceeded *at the provider*, flaky jobs retried with backoff, failures dead-lettered |
+| `notifications/tests/test_queue_500.py` | 500 jobs through an embedded Celery worker (`celery.contrib.testing`, in-memory broker, limiter on real Redis): none lost, each delivered exactly once, rate never exceeded *at the provider*, flaky jobs retried with backoff, failures dead-lettered |
 | `notifications/tests/test_rate_limiter.py` | The 2,000-in-10 s burst admits exactly 200; no rolling minute ever exceeds 200 over 10 min of overload; atomic under 16 racing threads; critical reserve; fails closed |
-| `notifications/tests/test_worker_crash.py` | SIGKILL of a pool child → requeued and delivered; SIGKILL of the whole worker → redelivered after `visibility_timeout` |
-| `notifications/tests/test_processing.py` | Every branch of a delivery attempt: backoff, dead-lettering, throttling, claims, fencing |
+| `notifications/tests/test_worker_crash.py` | SIGKILL of a pool child → requeued and delivered; SIGKILL of the whole worker → redelivered after `visibility_timeout` (real worker subprocesses, real Redis broker) |
+| `notifications/tests/test_processing.py` | Every branch of a delivery attempt: backoff, dead-lettering, throttling, claims, fencing, jobs that kill their worker every time |
 
 ## Section 4: recording
 

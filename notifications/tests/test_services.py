@@ -73,6 +73,19 @@ def test_sweeper_republishes_lost_messages_and_leaves_finished_jobs(apply_async)
     assert republish_stuck_jobs(QueuePolicy.from_settings()) == 0  # not re-picked straight away
 
 
+def test_sweeper_rescues_an_attempt_that_died_without_redelivery(apply_async):
+    """A hard time-limit kill acks the message, leaving the job SENDING with no
+    message anywhere. Once its claim has expired, the sweeper re-publishes it."""
+    policy = QueuePolicy.from_settings()
+    abandoned_at = timezone.now() - timedelta(seconds=policy.claim_ttl_s + 60)
+    fields = dict(kind=EmailJob.Kind.OTP, to="a@example.com", subject="s", body="b", status=EmailJob.Status.SENDING)
+    abandoned = EmailJob.objects.create(**fields, claimed_at=abandoned_at, updated_at=abandoned_at, enqueued_at=abandoned_at)
+    EmailJob.objects.create(**fields, claimed_at=timezone.now(), enqueued_at=abandoned_at)  # in flight right now
+
+    assert republish_stuck_jobs(policy) == 1
+    assert apply_async.call_args.kwargs["args"] == [str(abandoned.pk)]
+
+
 def test_replaying_a_dead_letter_gives_fresh_attempts(apply_async, django_capture_on_commit_callbacks):
     job = EmailJob.objects.create(
         kind=EmailJob.Kind.OTP, to="a@example.com", subject="s", body="b", status=EmailJob.Status.DEAD, attempts=6

@@ -10,7 +10,7 @@
 import re
 import statistics
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -86,14 +86,15 @@ class Command(BaseCommand):
         return rows, hot_spots
 
     def _query_shapes(self, recorded):
-        shapes, origins = Counter(), {}
+        """Every query shape in the request, with how often each line of our code issued it."""
+        origins = defaultdict(Counter)
         for query in recorded.queries.all():
             shape = re.sub(r"'[^']*'", "?", query.query)
             shape = re.sub(r"\b\d+(\.\d+)?\b", "?", shape)
             shape = re.sub(r"IN \((\?, )*\?\)", "IN (...)", shape)
-            shapes[shape] += 1
-            origins.setdefault(shape, self._origin(query.traceback))
-        return [(n, shape, origins[shape]) for shape, n in shapes.most_common(6)]
+            origins[shape][self._origin(query.traceback)] += 1
+        rows = [(sum(c.values()), shape, c) for shape, c in origins.items()]
+        return sorted(rows, key=lambda row: -row[0])
 
     def _origin(self, traceback):
         """First stack frame (silk stores the stack newest-first) inside orders/."""
@@ -214,14 +215,17 @@ class Command(BaseCommand):
             "| Times run | Query shape | Issued from |",
             "|---:|---|---|",
         ]
-        for n, shape, origin in hot_spots:
+        for n, shape, origins in hot_spots:
             shape = shape if len(shape) <= 160 else shape[:157] + "..."
-            out.append(f"| {n} | `{shape}` | {origin} |")
+            where = "<br>".join(f"{origin} ×{count}" for origin, count in origins.most_common())
+            out.append(f"| {n} | `{shape}` | {where} |")
+        out.append(f"| **{sum(n for n, _, _ in hot_spots)}** | total | |")
         out += [
             "",
-            "One query shape per serializer method, each run once per order, plus one product lookup "
-            "per line item. Two of the constant queries (items and products `IN (...)`) are the view's "
-            "`prefetch_related(\"items__product\")`. They still run, but nothing reads their results.",
+            "Per order: one item SELECT from `get_items` and one from `get_total` (the same shape, so "
+            "one row above), plus one `COUNT(*)` from `get_item_count`. Then one product SELECT per "
+            "non-refunded line. The two `IN (...)` rows are the view's "
+            "`prefetch_related(\"items__product\")`: they still run, but nothing reads their results.",
             "",
         ]
         return "\n".join(out)

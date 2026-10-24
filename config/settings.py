@@ -132,7 +132,9 @@ CELERY_TASK_DEFAULT_QUEUE = "default"
 # Crash safety. ANSWERS.md ("Section 2: SIGKILL") explains each one.
 CELERY_TASK_ACKS_LATE = True  # ack when the task returns, not when it starts
 CELERY_TASK_REJECT_ON_WORKER_LOST = True  # child process killed mid-task -> requeue, don't ack
-CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # a dead worker strands at most `concurrency` messages
+# Reserve at most `concurrency` ready messages per worker. Deferred (ETA) messages
+# are held on top of that: Celery raises the prefetch count for each one.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     # Unacked messages of a worker that vanished are redelivered after this.
     # Must be longer than any countdown we schedule, or Redis would redeliver
@@ -142,6 +144,9 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
     # kombu's default round-robin, so OTPs never wait behind a bulk backlog.
     "queue_order_strategy": "priority",
 }
+# The sweeper rides on the critical queue, so every email worker runs it and it
+# never waits behind a bulk backlog.
+CELERY_TASK_ROUTES = {"notifications.republish_stuck_jobs": {"queue": "emails.critical"}}
 CELERY_BEAT_SCHEDULE = {
     "republish-stuck-email-jobs": {"task": "notifications.republish_stuck_jobs", "schedule": 300.0},
 }

@@ -1,5 +1,6 @@
 """Every branch of one delivery attempt, without Celery or Redis."""
 
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -32,12 +33,15 @@ Status = EmailJob.Status
 
 
 class StubLimiter:
-    def __init__(self, allowed=True, retry_after_ms=0, error=None):
+    def __init__(self, allowed=True, retry_after_ms=0, error=None, during_call=None):
         self.allowed, self.retry_after_ms, self.error = allowed, retry_after_ms, error
+        self.during_call = during_call
         self.limits_requested = []
 
     def try_acquire(self, *, limit=None, now_ms=None):
         self.limits_requested.append(limit)
+        if self.during_call:
+            self.during_call()
         if self.error:
             raise self.error
         return Decision(self.allowed, self.retry_after_ms, 0)
@@ -56,6 +60,10 @@ class StubProvider:
         if self.errors:
             raise self.errors.pop(0)
         return "provider-msg-1"
+
+
+class WorkerKilled(BaseException):
+    """Stands in for SIGKILL: no except-branch in the task ever sees it."""
 
 
 def make_job(kind=EmailJob.Kind.ORDER_CONFIRMATION, **fields):
@@ -171,6 +179,45 @@ def test_job_abandoned_by_a_dead_worker_is_reclaimed_and_sent():
 
     assert run(job).outcome == Outcome.SENT
     assert (job.status, job.attempts) == (Status.SENT, 2)
+
+
+def test_job_that_kills_its_worker_every_time_is_dead_lettered():
+    """A poison message: every attempt dies mid-call, so no failure is ever
+    recorded. Attempts are counted at claim time, so it still runs out."""
+    job = make_job()
+    provider = StubProvider(*[WorkerKilled()] * 10)
+
+    for _ in range(POLICY.max_attempts):
+        with pytest.raises(WorkerKilled):
+            run(job, provider=provider)
+        # Redelivery arrives once the dead attempt's claim has expired.
+        expired = timezone.now() - timedelta(seconds=POLICY.claim_ttl_s + 1)
+        EmailJob.objects.filter(pk=job.pk).update(claimed_at=expired)
+
+    result = run(job, provider=provider)
+
+    assert result.outcome == Outcome.DEAD
+    assert (job.status, job.attempts, provider.calls) == (Status.DEAD, POLICY.max_attempts, POLICY.max_attempts)
+    assert job.dead_letter.reason == DeadLetter.Reason.RETRIES_EXHAUSTED
+    assert "worker died" in job.dead_letter.error
+
+
+def test_job_claimed_by_another_worker_between_read_and_claim_is_deferred():
+    job = make_job()
+    provider = StubProvider()
+
+    def another_worker_claims_it():
+        EmailJob.objects.filter(pk=job.pk).update(status=Status.SENDING, claimed_at=timezone.now(), attempts=1)
+
+    result = run(job, limiter=StubLimiter(during_call=another_worker_claims_it), provider=provider)
+
+    assert (result.outcome, result.detail) == (Outcome.DEFERRED, "claimed concurrently")
+    assert (job.attempts, provider.calls) == (1, 0)  # their attempt, not ours
+
+
+def test_message_for_an_unknown_job_is_skipped():
+    result = process_email_job(uuid.uuid4(), limiter=StubLimiter(), provider=StubProvider(), policy=POLICY)
+    assert (result.outcome, result.detail) == (Outcome.SKIPPED, "unknown job")
 
 
 def test_late_result_from_a_superseded_attempt_is_discarded():

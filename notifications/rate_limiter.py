@@ -59,7 +59,7 @@ class SlidingWindowRateLimiter:
         self.key = key
         self.limit = limit
         self.window_ms = window_ms
-        # EVALSHA, falling back to EVAL (and caching the script) on NOSCRIPT
+        # EVALSHA; on NOSCRIPT redis-py runs SCRIPT LOAD and retries the EVALSHA
         self._script = client.register_script(SLIDING_WINDOW_LUA)
 
     def try_acquire(self, *, limit=None, now_ms=None):

@@ -6,6 +6,7 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/orders/", include("orders.urls")),
     path("api/notifications/", include("notifications.urls")),
+    path("api-auth/", include("rest_framework.urls")),  # log-in link for DRF's browsable API
 ]
 
 if settings.ENABLE_SILK:

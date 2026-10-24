@@ -25,7 +25,8 @@ The provider accepts **200 emails/minute**. A flash sale delivers **2,000 reques
                          5. provider.send(idempotency_key=job.id)
                          6. sent ✓ │ transient: retrying + self.retry(backoff) │ permanent/exhausted: dead + DeadLetter
 
- celery beat, every 5 min: republish_stuck_jobs, which re-publishes jobs the broker never got or lost
+ celery beat, every 5 min: republish_stuck_jobs (on emails.critical), which re-publishes jobs the broker
+                           never got or lost, and attempts that died with nothing left to redeliver them
 ```
 
 A Celery message carries only a job id. Everything that matters (status, attempt count, last error, provider message id) lives in the `EmailJob` row. That one decision lets every failure mode be handled by asking the row what is true, instead of trusting that a message was delivered exactly once.
@@ -68,7 +69,7 @@ The test `test_sustained_overload_never_exceeds_limit_in_any_rolling_minute` run
 
 ### 2. How atomicity is guaranteed
 
-**A Lua script** (`register_script` uses EVALSHA and falls back to EVAL). Redis executes a script to completion without interleaving any other client's commands, so two workers can never both see 199 and both add the 200th.
+**A Lua script** (`register_script` calls EVALSHA; on `NOSCRIPT`, redis-py runs SCRIPT LOAD and retries). Redis executes a script to completion without interleaving any other client's commands, so two workers can never both see 199 and both add the 200th.
 
 - A **pipeline** is not atomic at all: it only batches round trips, and other clients' commands interleave.
 - **MULTI/EXEC** cannot branch on a value read inside the transaction (the ZCARD result). It would need WATCH plus an optimistic retry loop, and that loop degrades under exactly the contention a flash-sale burst creates.
@@ -76,7 +77,7 @@ The test `test_sustained_overload_never_exceeds_limit_in_any_rolling_minute` run
 
 The script reads the clock with Redis `TIME`, so all workers share one clock and worker clock skew can't stretch the window. Redis ≥ 5 replicates script *effects*, which is what allows TIME before writes.
 
-**Guard band.** The limiter admits a send at time *T*, but the provider counts it at *T + δ*, where δ (our network hop plus their ingress) varies. Two sends admitted exactly 60 s apart can arrive 59.9 s apart. So the window is configured as 60 s **+ 1 s guard** (`RATE_GUARD_MS`), at a cost of about 1.6% of throughput. This is not hypothetical. With the guard set to 0, the 500-job test, which measures *at the provider*, saw 51 calls in some 1 s window (limit 50) in 3 of 4 runs. With the guard, every run stays at or below 50.
+**Guard band.** The limiter admits a send at time *T*, but the provider counts it at *T + δ*, where δ (our network hop plus their ingress) varies. Two sends admitted exactly 60 s apart can arrive 59.9 s apart. So the window is configured as 60 s **+ 1 s guard** (`RATE_GUARD_MS`), at a cost of about 1.6% of throughput. This is not hypothetical. With the guard set to 0, the 500-job test, which measures *at the provider*, saw 51 calls in some 1 s window (limit 50) in 4 of 8 runs, across two separate batches. With the guard, every run has stayed at or below 50.
 
 ### 3. Redis failure: fail closed
 
@@ -96,7 +97,7 @@ The two kinds are also routed to separate lists. The transport option `queue_ord
 
 ## Retries, backoff and dead-letters
 
-- **Transient** errors (timeouts, 5xx, 429, and unknown exceptions such as bugs) are retried with exponential backoff and "equal jitter". The delay is drawn from [d/2, d] with d = 10 s × 2^(attempt−1), capped at 300 s, giving roughly 10, 20, 40, 80 and 160 s across 6 attempts. The fixed half guarantees a real pause; the random half stops a thousand jobs that failed during the same provider blip from retrying in lockstep.
+- **Transient** errors (timeouts, 5xx, 429, and unknown exceptions such as bugs) are retried with exponential backoff and "equal jitter". The delay is drawn from [d/2, d] with d = 10 s × 2^(attempt−1), capped at 300 s. Across 6 attempts that gives 5 retries, with ceilings of 10, 20, 40, 80 and 160 s. The fixed half guarantees a real pause; the random half stops a thousand jobs that failed during the same provider blip from retrying in lockstep.
 - **Permanent** errors (invalid address, rejected content) are dead-lettered immediately. That matters more here than usual: **every retry spends a slot of the 200/min budget**, so retrying a hard bounce six times directly delays six good emails.
 - **Attempts are counted in the DB row**, not with Celery's `request.retries`. Throttling deferrals use `self.retry()` too, and must not use up attempts. The count is incremented **when the job is claimed, before the provider call**. So a job that crashes its worker every time (say, an attachment that OOMs the process) still runs out of attempts instead of crash-looping forever.
 - **Dead letters** go to the `DeadLetter` table (reason, last error, attempts), with an admin action "Replay" that resets attempts and re-publishes. I chose a table over a Redis DLQ list because it survives Redis, can be queried and joined with the job, and replaying needs human context.
@@ -106,10 +107,12 @@ The two kinds are also routed to separate lists. The transport option `queue_ord
 | What fails | What happens | Where |
 |---|---|---|
 | Request rolls back after enqueueing | No row, no message (`transaction.on_commit`) | `test_rolled_back_request_queues_nothing` |
-| Redis down when the job is created | Row stays `queued` with `enqueued_at=NULL`; the sweeper publishes it after 60 s | `test_broker_outage_at_enqueue_is_recovered_by_the_sweeper` |
+| Redis down when the job is created | Row stays `queued` with `enqueued_at=NULL`; the next sweep (every 5 min) publishes it once it is over 60 s old | `test_broker_outage_at_enqueue_is_recovered_by_the_sweeper` |
 | Pool child SIGKILL'd mid-send | Requeued at once (`task_reject_on_worker_lost`); the claim TTL stops a concurrent double-send; delivered on attempt 2 | `test_pool_child_killed_mid_send_is_requeued_and_delivered` |
 | Whole worker / host dies | Message stays in Redis `unacked`; restored after `visibility_timeout`; delivered on attempt 2 | `test_whole_worker_killed_mid_send_is_redelivered_after_visibility_timeout` |
-| Deferred (ETA) messages on a dying worker | Same path: they are unacked messages too | — |
+| Deferred (ETA) messages on a dying worker | Same path: they are unacked messages too. Prefetch doesn't bound them (Celery raises the prefetch count per ETA message), so one dead worker can strand hundreds during a sale | — |
+| Hard `time_limit` kills an attempt | Celery *acks* the message (`task_acks_on_failure_or_timeout`), so no redelivery; the sweeper re-publishes `sending` jobs whose claim has expired | `test_sweeper_rescues_an_attempt_that_died_without_redelivery` |
+| A job that kills its worker on every attempt | Attempts are counted at claim time; a redelivery that finds an expired claim with no attempts left dead-letters it without calling the provider | `test_job_that_kills_its_worker_every_time_is_dead_lettered` |
 | Redis restarts | AOF with `appendfsync everysec` loses at most ~1 s of writes; anything lost is re-published by the sweeper after 30 min without progress | `docker-compose.yml`, `test_sweeper_republishes_lost_messages_and_leaves_finished_jobs` |
 | Two messages for one job (redelivery, or a sweeper duplicate) | The conditional-UPDATE claim lets exactly one through; the other finds the job sent, or waits | `test_duplicate_message_for_a_finished_job_is_a_no_op`, `test_job_held_by_a_live_worker_waits_for_the_claim_to_expire` |
 | An attempt overruns its claim and another worker takes over | Result writes are conditional on `claimed_at` (a fencing token), so the late write is discarded | `test_late_result_from_a_superseded_attempt_is_discarded` |
@@ -119,12 +122,12 @@ The two kinds are also routed to separate lists. The transport option `queue_ord
 ## Measured behaviour
 
 - **500-job test** (limit scaled to 50/s with a 0.1 s guard so it runs in ~15 s): 509 provider calls (500 jobs plus the scripted failures' retries); busiest 1 s window = **50**; 498 sent exactly once, plus 2 dead-letters, as scripted.
-- **Live run against real Redis, production config (200/min), 4 prefork workers, 450 emails:** the limiter window peaked at **195/200**: 180 bulk plus OTPs using the reserve. The backlog drained in one-minute waves: 190 sent, then 179, then 80. Final state: 449 sent, 1 dead-letter (the scripted hard bounce). In total there were 508 re-schedules, about 1.1 per job.
+- **Live run against real Redis, production config (200/min), one worker with 4 prefork processes, 450 emails:** the limiter window peaked at **195/200**: 180 bulk plus OTPs using the reserve. The backlog drained in one-minute waves: 190 sent, then 179, then 80. Final state: 449 sent, 1 dead-letter (the scripted hard bounce). In total there were 508 re-schedules, about 1.1 per job.
 
 ## Known limitations and what I'd do next
 
 - **Thundering herd.** Denied jobs are each told "a slot frees at *T*", and they wake together (spread only by up to 2 s of jitter), so most bounce again. That cost about 1.1 re-schedules per job above. For 2,000 jobs it is roughly 10k cheap limiter calls over 11 minutes, about 15/s, trivial for Redis. At 100× the scale I would switch to *reservations* (GCRA): each denied job gets its own future slot and wakes exactly once.
-- **ETA messages live in worker memory**, and Redis hides them behind `visibility_timeout`. That's fine for thousands. For millions I would store a `not_before` column and have a dispatcher publish only jobs that are due.
+- **ETA messages live in worker memory**, outside the prefetch limit, and Redis hides them behind `visibility_timeout`. That's fine for thousands. For millions I would store a `not_before` column and have a dispatcher publish only jobs that are due.
 - **The `visibility_timeout` trade-off.** It must exceed the longest countdown we schedule: 300 s of backoff and about 63 s of throttling. Otherwise Redis redelivers deferred messages that a live worker still holds. Duplicates would be harmless thanks to the claim, but wasteful. A longer timeout means slower recovery after a host dies, which is why it is 1 h with the 30-min sweeper as the faster backstop.
 - **A late OTP is useless.** Add `expires_at` and dead-letter expired OTPs instead of sending them.
 - **The provider's 429 `Retry-After`** should pause the shared limiter for everyone. Today it is just another transient error for that one job.
