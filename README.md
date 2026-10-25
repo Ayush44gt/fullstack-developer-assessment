@@ -7,7 +7,7 @@ Ayush Garg · Python · Django · Celery · Redis
 | 1. Diagnose a broken system | `orders/` (fix), `orders/regression.py` (deployed bug), `orders/management/commands/profile_summary.py` | [ANSWERS.md § 1](ANSWERS.md#section-1-diagnose-a-broken-system) · [profiler evidence](docs/section1/profiling-evidence.md) |
 | 2. Rate-limited async job queue | `notifications/` | [DESIGN.md](DESIGN.md) · [ANSWERS.md § 2 (SIGKILL)](ANSWERS.md#section-2-what-happens-to-in-flight-tasks-when-a-worker-is-sigkilld) |
 | 3. Architecture review (A and B) | — | [ANSWERS.md § 3](ANSWERS.md#section-3-written-architecture-review) |
-| 4. Recording (optional) | `email_burst`, `queue_monitor` commands | Loom: _to be added_ |
+| 4. Recording (optional) | `email_burst`, `queue_monitor` commands | Not included; the demo is reproducible live, see [Section 4](#section-4-live-demo-instead-of-a-recording) |
 
 ## Setup (about 3 minutes)
 
@@ -62,9 +62,14 @@ Key tests:
 | `notifications/tests/test_worker_crash.py` | SIGKILL of a pool child → requeued and delivered; SIGKILL of the whole worker → redelivered after `visibility_timeout` (real worker subprocesses, real Redis broker) |
 | `notifications/tests/test_processing.py` | Every branch of a delivery attempt: backoff, dead-lettering, throttling, claims, fencing, jobs that kill their worker every time |
 
-## Section 4: recording
+## Section 4: live demo instead of a recording
 
-_Loom link: to be added._ The recording follows the Section 2 steps above: a fresh worker, `queue_monitor` showing Redis state live, and a 500-email burst throttled at ≤ 200/min with the scripted failures retrying.
+Section 4 is optional, and no recording is included. Everything it asks to see can be reproduced live in about 5 minutes with the Section 2 steps above:
+
+- a fresh worker started from a new terminal;
+- `queue_monitor` showing the Redis queue depth, unacked/deferred messages and the limiter window in real time;
+- a 500-email burst that never exceeds 200/min;
+- the scripted failures retrying with backoff in the worker log, and the hard bounce in **Admin → Dead letters**.
 
 ## Layout
 
